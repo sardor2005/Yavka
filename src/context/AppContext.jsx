@@ -49,7 +49,7 @@ export function AppProvider({ children }) {
   const meetingIds = meetings.map(m => m.id).sort().join(',');
   useEffect(() => {
     if (!supabase || !user) return;
-    let alive = true;
+    let alive = true; setConnected(false);
     const sync = () => {
       clearTimeout(debounce.current);
       debounce.current = setTimeout(() => { if (alive) { refresh(); window.dispatchEvent(new Event('yavka:sync')); } }, 180);
@@ -63,7 +63,15 @@ export function AppProvider({ children }) {
     for (const id of meetingIds.split(',').filter(Boolean)) {
       watch('meetings', `id=eq.${id}`); watch('meeting_participants', `meeting_id=eq.${id}`); watch('meeting_photos', `meeting_id=eq.${id}`);
     }
-    channel.subscribe(status => { if (!alive) return; setConnected(status === 'SUBSCRIBED'); if (status === 'SUBSCRIBED') sync(); });
+    channel.on('system', {}, payload => {
+      if (!alive || payload.extension !== 'postgres_changes') return;
+      setConnected(payload.status === 'ok');
+      if (payload.status === 'ok') sync();
+    }).subscribe(status => {
+      if (!alive) return;
+      if (status !== 'SUBSCRIBED') setConnected(false);
+      if (status === 'SUBSCRIBED') sync();
+    });
     window.addEventListener('online', sync); window.addEventListener('focus', sync);
     const visibility = () => { if (document.visibilityState === 'visible') sync(); };
     document.addEventListener('visibilitychange', visibility);

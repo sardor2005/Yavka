@@ -209,16 +209,39 @@ test('real Auth, PostgREST, Storage and Realtime across three separate users', {
     let rejectEvent
     const eventPromise = new Promise((resolve, reject) => { resolveEvent = resolve; rejectEvent = reject })
     eventPromise.catch(() => {})
-    const timeout = setTimeout(() => rejectEvent(new Error('Realtime did not deliver the member message')), 20_000)
-    const channel = bob.connection.channel(`integration-${runId}`)
+    let resolveReady
+    let rejectReady
+    const readyPromise = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
+    readyPromise.catch(() => {})
+    let readinessError = false
+    const readyTimeout = setTimeout(() => rejectReady(new Error(readinessError
+      ? 'Realtime Postgres Changes reported a subscription error and did not become ready'
+      : 'Realtime Postgres Changes did not confirm its subscription')), 20_000)
+    let deliveryTimeout
+    const channel = bob.connection.channel(`integration-${runId}`, {
+      config: { postgres_changes_options: { wait: true, timeout: 15_000 } },
+    })
+      // Realtime v2.73.2 joins the channel before registering PostgreSQL changes.
+      // It ignores the newer wait option, but emits this supported system event.
+      // A message sent before it can legitimately be absent from the WAL stream.
+      .on('system', {}, payload => {
+        if (payload.extension !== 'postgres_changes') return
+        if (payload.status === 'ok') { clearTimeout(readyTimeout); resolveReady() }
+        if (payload.status === 'error') readinessError = true
+      })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_messages', filter: `meeting_id=eq.${meeting.id}` }, payload => {
         if (payload.new.body === body) resolveEvent(payload.new)
       })
     try {
       await new Promise((resolve, reject) => channel.subscribe(status => {
         if (status === 'SUBSCRIBED') resolve()
-        if (['TIMED_OUT', 'CHANNEL_ERROR', 'CLOSED'].includes(status)) reject(new Error(`Realtime subscription: ${status}`))
+        if (['TIMED_OUT', 'CHANNEL_ERROR', 'CLOSED'].includes(status)) {
+          const failure = new Error(`Realtime subscription: ${status}`)
+          reject(failure); rejectReady(failure)
+        }
       }))
+      await readyPromise
+      deliveryTimeout = setTimeout(() => rejectEvent(new Error('Realtime did not deliver the member message')), 20_000)
       const message = await rpc(alice.connection, 'send_message', { p_meeting_id: meeting.id, p_body: body })
       const event = await eventPromise
       assert.equal(event.id, message.id)
@@ -226,7 +249,8 @@ test('real Auth, PostgREST, Storage and Realtime across three separate users', {
       assert.equal(ok(await eve.connection.from('chat_messages').select('*').eq('meeting_id', meeting.id)).length, 0)
       rejected(await alice.connection.from('chat_messages').insert({ meeting_id: meeting.id, author_id: bob.id, body: 'Impersonated' }))
     } finally {
-      clearTimeout(timeout)
+      clearTimeout(readyTimeout)
+      clearTimeout(deliveryTimeout)
       await bob.connection.removeChannel(channel)
     }
   })

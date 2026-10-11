@@ -32,13 +32,21 @@ export default function MeetingChat({ meetingId }) {
     finally { if (alive.current && run === request.current) setLoading(false); }
   }, [meetingId, user?.id]);
   useEffect(() => {
-    alive.current = true; setMessages([]); setLoading(true); cursor.current = null; atBottom.current = true;
+    alive.current = true; setConnected(false); setMessages([]); setLoading(true); cursor.current = null; atBottom.current = true;
     reload(true);
     const sync = () => reload();
     const channel = supabase?.channel(`chat-${meetingId}-${user?.id}`).on('postgres_changes', { event: '*', schema: 'public', table: 'chat_messages', filter: `meeting_id=eq.${meetingId}` }, payload => {
       if (payload.eventType === 'DELETE') setMessages(rows => rows.filter(row => row.id !== payload.old.id));
       reload();
-    }).subscribe(status => { if (!alive.current) return; setConnected(status === 'SUBSCRIBED'); if (status === 'SUBSCRIBED') reload(); });
+    }).on('system', {}, payload => {
+      if (!alive.current || payload.extension !== 'postgres_changes') return;
+      setConnected(payload.status === 'ok');
+      if (payload.status === 'ok') reload();
+    }).subscribe(status => {
+      if (!alive.current) return;
+      if (status !== 'SUBSCRIBED') setConnected(false);
+      if (status === 'SUBSCRIBED') reload();
+    });
     window.addEventListener('online', sync); window.addEventListener('yavka:sync', sync);
     const poll = setInterval(sync, 30000);
     return () => { alive.current = false; request.current++; clearInterval(poll); window.removeEventListener('online', sync); window.removeEventListener('yavka:sync', sync); if (channel) supabase.removeChannel(channel); };
