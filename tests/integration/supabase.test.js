@@ -13,6 +13,9 @@ if (!apiUrl || !publicKey || !serviceKey) {
 if (!['localhost', '127.0.0.1', '[::1]'].includes(new URL(apiUrl).hostname)) {
   throw new Error('Integration fixtures must run against a local Supabase stack.')
 }
+if (!['localhost', '127.0.0.1', '[::1]'].includes(new URL(mailUrl).hostname)) {
+  throw new Error('Delivered-email tests may read only the local Mailpit mailbox.')
+}
 const options = { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } }
 const client = () => createClient(apiUrl, publicKey, options)
 const admin = createClient(apiUrl, serviceKey, options)
@@ -24,27 +27,34 @@ const ok = result => {
 const rejected = result => assert.ok(result.error, 'The unauthorized or invalid operation must fail')
 const rpc = async (connection, name, parameters) => ok(await connection.rpc(name, parameters))
 
-async function confirmationToken(email) {
+async function deliveredMessages() {
+  const response = await fetch(`${mailUrl}/api/v1/messages`)
+  assert.ok(response.ok, 'Local Mailpit must be available')
+  return (await response.json()).messages || []
+}
+
+async function deliveredToken(email, type, excludedIds = new Set()) {
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
-    const response = await fetch(`${mailUrl}/api/v1/messages`)
-    assert.ok(response.ok, 'Local Mailpit must be available')
-    const messages = (await response.json()).messages || []
-    const message = messages.find(item => item.To?.some(recipient => recipient.Address === email))
-    if (message) {
+    const messages = (await deliveredMessages())
+      .filter(item => !excludedIds.has(item.ID) && item.To?.some(recipient => recipient.Address === email))
+      .sort((a, b) => Date.parse(b.Created) - Date.parse(a.Created))
+    for (const message of messages) {
       const detailResponse = await fetch(`${mailUrl}/api/v1/message/${message.ID}`)
       assert.ok(detailResponse.ok)
       const detail = await detailResponse.json()
       const body = `${detail.Text || ''}\n${detail.HTML || ''}`.replaceAll('&amp;', '&')
-      const link = body.match(/https?:\/\/[^\s"<>]+\/auth\/v1\/verify\?[^\s"<>]+/)
-      assert.ok(link, 'The delivered email must contain a real Auth verification link')
-      const token = new URL(link[0]).searchParams.get('token')
-      assert.ok(token, 'The verification link must contain its token hash')
-      return token
+      const links = body.match(/https?:\/\/[^\s"<>]+\/auth\/v1\/verify\?[^\s"<>]+/g) || []
+      for (const link of links) {
+        const url = new URL(link)
+        if (url.searchParams.get('type') !== type) continue
+        assert.ok(url.searchParams.get('token'), 'The delivered verification link must contain its token hash')
+        return url.searchParams.get('token')
+      }
     }
     await pause(150)
   }
-  throw new Error('Local Auth did not deliver the confirmation email within 30 seconds')
+  throw new Error(`Local Auth did not deliver a ${type} email within 30 seconds`)
 }
 
 test('real Auth, PostgREST, Storage and Realtime across three separate users', { timeout: 240_000 }, async t => {
@@ -65,7 +75,7 @@ test('real Auth, PostgREST, Storage and Realtime across three separate users', {
       assert.equal(registration.session, null, 'Unconfirmed registration must not grant a session')
       assert.ok(registration.user?.id)
       actors.push({ connection, id: registration.user.id, email, password })
-      const tokenHash = await confirmationToken(email)
+      const tokenHash = await deliveredToken(email, 'signup')
       const verification = ok(await connection.auth.verifyOtp({ token_hash: tokenHash, type: 'signup' }))
       assert.equal(verification.user.id, registration.user.id)
       assert.ok(verification.session?.access_token)
@@ -85,6 +95,31 @@ test('real Auth, PostgREST, Storage and Realtime across three separate users', {
   let meeting
   let linkMeeting
   let photo
+
+  await t.test('password recovery delivers a new email and restores access with the changed password', async () => {
+    const previousMessages = new Set((await deliveredMessages()).map(message => message.ID))
+    const recoveryConnection = client()
+    ok(await recoveryConnection.auth.resetPasswordForEmail(bob.email, {
+      redirectTo: 'http://127.0.0.1:5173/auth/reset',
+    }))
+    const recoveryToken = await deliveredToken(bob.email, 'recovery', previousMessages)
+    const recovered = ok(await recoveryConnection.auth.verifyOtp({ token_hash: recoveryToken, type: 'recovery' }))
+    assert.equal(recovered.user.id, bob.id)
+    assert.ok(recovered.session?.access_token, 'A delivered recovery token must create an authenticated recovery session')
+    const oldPassword = bob.password
+    const nextPassword = `Recovered-${randomUUID()}-1a!`
+    const changed = ok(await recoveryConnection.auth.updateUser({ password: nextPassword }))
+    assert.equal(changed.user.id, bob.id)
+    ok(await recoveryConnection.auth.signOut({ scope: 'local' }))
+    rejected(await client().auth.signInWithPassword({ email: bob.email, password: oldPassword }))
+    const nextConnection = client()
+    const signedIn = ok(await nextConnection.auth.signInWithPassword({ email: bob.email, password: nextPassword }))
+    assert.equal(signedIn.user.id, bob.id)
+    const profile = ok(await nextConnection.from('profiles').select('id,public_id').eq('id', bob.id).single())
+    assert.equal(profile.public_id, bob.publicId, 'Recovery must preserve the original account and server profile')
+    bob.connection = nextConnection
+    bob.password = nextPassword
+  })
 
   await t.test('friend requests require recipient acceptance and prevent duplicates and impersonation', async () => {
     rejected(await alice.connection.rpc('request_friend', { p_user_id: alice.id }))
@@ -206,6 +241,11 @@ test('real Auth, PostgREST, Storage and Realtime across three separate users', {
     ok(await alice.connection.storage.from('meeting-photos').upload(photo.path, bytes, { contentType: 'image/png' }))
     uploadedPaths.push(photo.path)
     await rpc(alice.connection, 'finish_photo', { p_photo_id: photo.id })
+    const foreignMetadataDeletion = ok(await bob.connection.from('meeting_photos').delete().eq('id', photo.id).select('id'))
+    assert.deepEqual(foreignMetadataDeletion, [], 'A participant cannot delete another author photo metadata')
+    const foreignObjectDeletion = ok(await bob.connection.storage.from('meeting-photos').remove([photo.path]))
+    assert.deepEqual(foreignObjectDeletion, [], 'Storage deletion filters out another author object')
+    assert.equal(ok(await alice.connection.from('meeting_photos').select('id').eq('id', photo.id).single()).id, photo.id)
     const signed = ok(await bob.connection.storage.from('meeting-photos').createSignedUrl(photo.path, 60))
     const response = await fetch(signed.signedUrl)
     assert.ok(response.ok)
@@ -225,7 +265,15 @@ test('real Auth, PostgREST, Storage and Realtime across three separate users', {
     await rpc(alice.connection, 'complete_meeting', { p_meeting_id: meeting.id })
     const ratings = ok(await alice.connection.from('rating_events').select('*').eq('meeting_id', meeting.id))
     assert.equal(ratings.length, 2)
-    assert.equal(ratings.find(row => row.user_id === bob.id).outcome, 'no_show')
+    const bobRating = ratings.find(row => row.user_id === bob.id)
+    assert.equal(bobRating.outcome, 'no_show')
+    assert.equal(bobRating.points, -5)
+    const aliceRating = ratings.find(row => row.user_id === alice.id)
+    const aliceOnTime = Date.parse(aliceRating.arrived_at) <= Date.parse(aliceRating.starts_at)
+    assert.equal(aliceRating.outcome, aliceOnTime ? 'on_time' : 'late')
+    assert.equal(aliceRating.points, aliceOnTime ? 10 : 0, 'Points must derive from server timestamps, not client input')
+    const beforeReversal = await rpc(bob.connection, 'rating_summary')
+    assert.deepEqual(beforeReversal, { total_score: -5, meeting_count: 1, on_time: 0, late: 0, no_show: 1 })
     assert.ok(ratings.every(row => row.confirmation === 'manual_unverified'))
     rejected(await bob.connection.from('rating_events').update({ points: 10 }).eq('meeting_id', meeting.id))
     rejected(await bob.connection.rpc('reverse_rating', { p_meeting_id: meeting.id, p_user_id: bob.id }))
@@ -234,6 +282,8 @@ test('real Auth, PostgREST, Storage and Realtime across three separate users', {
     await rpc(alice.connection, 'reverse_rating', { p_meeting_id: meeting.id, p_user_id: bob.id })
     const reversed = ok(await bob.connection.from('rating_events').select('*').eq('meeting_id', meeting.id).eq('user_id', bob.id).single())
     assert.ok(reversed.revoked_at)
+    const afterReversal = await rpc(bob.connection, 'rating_summary')
+    assert.deepEqual(afterReversal, { total_score: 0, meeting_count: 0, on_time: 0, late: 0, no_show: 0 })
     rejected(await bob.connection.rpc('set_arrival', { p_meeting_id: meeting.id, p_status: 'arrived' }))
     rejected(await bob.connection.rpc('save_memory', { p_meeting_id: meeting.id, p_note: 'Impersonated memory' }))
     const memory = await rpc(alice.connection, 'save_memory', { p_meeting_id: meeting.id, p_note: 'Confirmed integration memory' })

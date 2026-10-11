@@ -141,6 +141,16 @@ select pg_temp.expect_error(format('select public.send_message(%L,''delete-spam'
 select set_config('request.jwt.claim.sub','22222222-2222-4222-8222-222222222222',true);
 insert into fixtures values('photo',public.reserve_photo((select (value->>'id')::uuid from fixtures where key='meeting'),'Friends','image/jpeg',100));
 select pg_temp.expect_error(format('select public.finish_photo(%L)',(select value->>'id' from fixtures where key='photo')),'P0001','cannot finish nonexistent upload');
+-- The official Storage v1.35.3 permission probe inserts no metadata and rolls
+-- back before sending bytes. Newer Storage sends only MIME and contentLength.
+savepoint storage_probe;
+insert into storage.objects(bucket_id,name) values('meeting-photos',(select value->>'path' from fixtures where key='photo'));
+select pg_temp.assert((select metadata is null from storage.objects where name=(select value->>'path' from fixtures where key='photo')),'pinned Storage NULL-metadata permission probe allowed');
+rollback to savepoint storage_probe;
+insert into storage.objects(bucket_id,name,metadata) values('meeting-photos',(select value->>'path' from fixtures where key='photo'),'{"contentLength":100,"mimetype":"image/jpeg"}');
+select pg_temp.expect_error(format('select public.finish_photo(%L)',(select value->>'id' from fixtures where key='photo')),'P0001','preflight metadata cannot publish without final exact size');
+rollback to savepoint storage_probe;
+select pg_temp.expect_error(format('insert into storage.objects(bucket_id,name,metadata) values(''meeting-photos'',%L,''{"contentLength":101,"mimetype":"image/jpeg"}'')',(select value->>'path' from fixtures where key='photo')),'42501','Storage rejects mismatched declared contentLength');
 select pg_temp.expect_error(format('insert into storage.objects(bucket_id,name,metadata) values(''meeting-photos'',%L,''{"size":101,"mimetype":"image/jpeg"}'')',(select value->>'path' from fixtures where key='photo')),'42501','Storage rejects mismatch to reserved size');
 insert into storage.objects(bucket_id,name,metadata) values('meeting-photos',(select value->>'path' from fixtures where key='photo'),' {"size":100,"mimetype":"image/jpeg"}');
 select public.finish_photo((select (value->>'id')::uuid from fixtures where key='photo'));
@@ -220,10 +230,58 @@ select public.complete_meeting((select (value->>'id')::uuid from fixtures where 
 select pg_temp.assert((select outcome='on_time' and points=10 from public.rating_events where meeting_id=(select (value->>'id')::uuid from fixtures where key='on_time_meeting')),'on-time experimental score +10');
 select pg_temp.assert(public.rating_summary()->>'total_score'='10','server summary includes only active scores');
 
+reset role;
+select pg_temp.expect_error(format('update storage.objects set metadata='' {"size":101,"mimetype":"image/jpeg"}'' where name=%L',(select value->>'path' from fixtures where key='photo')),'42501','final Storage superuser write still enforces reserved size');
+update storage.objects set metadata=metadata||'{"uploaded":true}' where name=(select value->>'path' from fixtures where key='photo');
+select pg_temp.assert((select metadata->>'uploaded'='true' from storage.objects where name=(select value->>'path' from fixtures where key='photo')),'matching administrative restore permitted for existing ready reservation');
+select pg_temp.expect_error(format('insert into storage.objects(bucket_id,name,metadata) values(''meeting-photos'',%L,''{"size":100,"mimetype":"image/jpeg"}'')','11111111-1111-4111-8111-111111111111/11111111-1111-4111-8111-111111111111/'||gen_random_uuid()||'.jpg'),'42501','Storage superuser cannot create unreserved final object');
+set local role authenticated;
+insert into fixtures values('reclaimed_photo',public.reserve_photo((select (value->>'id')::uuid from fixtures where key='on_time_meeting'),'Reclaimed upload','image/jpeg',100));
+reset role;
+delete from public.meeting_photos where id=(select (value->>'id')::uuid from fixtures where key='reclaimed_photo');
+select pg_temp.expect_error(format('insert into storage.objects(bucket_id,name,metadata) values(''meeting-photos'',%L,''{"size":100,"mimetype":"image/jpeg"}'')',(select value->>'path' from fixtures where key='reclaimed_photo')),'42501','final internal Storage write cannot outlive reclaimed reservation');
+set local role authenticated;
+
 insert into fixtures values('cancelled_photo',public.reserve_photo((select (value->>'id')::uuid from fixtures where key='on_time_meeting'),'Cancelled upload','image/jpeg',100));
 insert into storage.objects(bucket_id,name,metadata) values('meeting-photos',(select value->>'path' from fixtures where key='cancelled_photo'),'{"size":100,"mimetype":"image/jpeg"}');
 select public.cancel_meeting((select (value->>'id')::uuid from fixtures where key='on_time_meeting'));
 select pg_temp.expect_error(format('select public.finish_photo(%L)',(select value->>'id' from fixtures where key='cancelled_photo')),'42501','cancellation between upload and finish blocks publication');
+
+-- Exercise the real RPCs twenty times, rather than merely seeding rate counters.
+-- The stranger now creates its own isolated fixture, after all outsider checks.
+select set_config('request.jwt.claim.sub','33333333-3333-4333-8333-333333333333',true);
+insert into fixtures values('abuse_meeting',to_jsonb(public.create_meeting(jsonb_build_object('title','Status anti-abuse','place_name','Cafe',
+  'starts_at',to_char((clock_timestamp()+interval '1 day') at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'),'time_zone','UTC'))));
+select public.respond_attendance((select (value->>'id')::uuid from fixtures where key='abuse_meeting'),'accepted');
+select pg_temp.assert((select count(*)=0 from public.attendance_events where meeting_id=(select (value->>'id')::uuid from fixtures where key='abuse_meeting')),'unchanged attendance produces no event');
+do $$ declare v_meeting uuid := (select (value->>'id')::uuid from fixtures where key='abuse_meeting'); v_index integer; begin
+  for v_index in 1..20 loop
+    perform public.respond_attendance(v_meeting,case when v_index%2=1 then 'declined' else 'accepted' end);
+  end loop;
+end $$;
+select pg_temp.expect_error(format('select public.respond_attendance(%L,''declined'')',(select value->>'id' from fixtures where key='abuse_meeting')),'P0001','21st attendance change within minute denied');
+select pg_temp.assert((select invitation_status='accepted' from public.meeting_participants where meeting_id=(select (value->>'id')::uuid from fixtures where key='abuse_meeting') and user_id=auth.uid()),'denied attendance change preserves participant state');
+select public.respond_attendance((select (value->>'id')::uuid from fixtures where key='abuse_meeting'),'accepted');
+select pg_temp.assert((select count(*)=20 from public.attendance_events where meeting_id=(select (value->>'id')::uuid from fixtures where key='abuse_meeting')),'idempotent attendance retry does not consume event after cap');
+do $$ declare v_meeting uuid := (select (value->>'id')::uuid from fixtures where key='abuse_meeting'); v_index integer; begin
+  for v_index in 1..20 loop
+    perform public.set_arrival(v_meeting,case when v_index%2=1 then 'ready' else 'pending' end);
+  end loop;
+end $$;
+select pg_temp.expect_error(format('select public.set_arrival(%L,''arrived'')',(select value->>'id' from fixtures where key='abuse_meeting')),'P0001','21st arrival change within minute denied');
+select pg_temp.assert((select arrival_status='pending' and arrived_at is null from public.meeting_participants where meeting_id=(select (value->>'id')::uuid from fixtures where key='abuse_meeting') and user_id=auth.uid()),'denied arrival change cannot create timestamp');
+select public.set_arrival((select (value->>'id')::uuid from fixtures where key='abuse_meeting'),'pending');
+select pg_temp.assert((select count(*)=40 from public.attendance_events where meeting_id=(select (value->>'id')::uuid from fixtures where key='abuse_meeting')),'duplicate arrival retry does not create event after cap');
+
+-- The owner advances only this fixture's rate window; no long test sleeps are needed.
+reset role;
+update private.rpc_events set occurred_at=clock_timestamp()-interval '2 minutes'
+  where user_id='33333333-3333-4333-8333-333333333333' and action='arrival';
+set local role authenticated;
+insert into fixtures values('abuse_first_arrival',to_jsonb(public.set_arrival((select (value->>'id')::uuid from fixtures where key='abuse_meeting'),'arrived')));
+select pg_temp.assert((public.set_arrival((select (value->>'id')::uuid from fixtures where key='abuse_meeting'),'arrived')).arrived_at=(select (value->>'arrived_at')::timestamptz from fixtures where key='abuse_first_arrival'),'idempotent arrival retains first server timestamp after rate window');
+select pg_temp.expect_error(format('select public.set_arrival(%L,''pending'')',(select value->>'id' from fixtures where key='abuse_meeting')),'P0001','first arrival cannot be reset after window');
+select pg_temp.assert((select count(*)=41 from public.attendance_events where meeting_id=(select (value->>'id')::uuid from fixtures where key='abuse_meeting')),'arrival retry and forbidden reset create no duplicate events');
 
 select 'PASS: PostgreSQL positive and negative access, invitations, Storage, arrival, quota and rating tests' as result;
 rollback;

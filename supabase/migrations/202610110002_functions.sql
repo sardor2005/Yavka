@@ -230,6 +230,9 @@ begin
   select status into v_status from public.meetings where id=p_meeting_id for update;
   if v_status is distinct from 'scheduled' or not private.has_meeting_access(p_meeting_id) then raise exception 'Нет доступа к активной встрече.' using errcode='42501'; end if;
   if p_response is null or p_response not in ('accepted','declined') then raise exception 'Укажите участие или отказ.'; end if;
+  select * into v_person from public.meeting_participants where meeting_id=p_meeting_id and user_id=v_user for update;
+  if v_person.invitation_status=p_response then return v_person; end if;
+  perform private.check_rate('attendance',20,interval '1 minute');
   update public.meeting_participants set invitation_status=p_response,
     arrival_status=case when p_response='declined' then 'pending' else arrival_status end,
     arrived_at=case when p_response='declined' then null else arrived_at end
@@ -247,11 +250,12 @@ begin
   if p_status is null or p_status not in ('pending','ready','on_way','arrived') then raise exception 'Недопустимый статус прибытия.'; end if;
   select * into v_person from public.meeting_participants where meeting_id=p_meeting_id and user_id=v_user for update;
   if v_person.invitation_status<>'accepted' then raise exception 'Сначала подтвердите участие.'; end if;
+  if v_person.arrival_status=p_status then return v_person; end if;
   -- The first server timestamp is immutable. Clients cannot repeatedly reset an arrival.
   if v_person.arrival_status='arrived' then
-    if p_status='arrived' then return v_person; end if;
     raise exception 'Отметка прибытия уже сохранена.';
   end if;
+  perform private.check_rate('arrival',20,interval '1 minute');
   update public.meeting_participants set arrival_status=p_status,
     arrived_at=case when p_status='arrived' then clock_timestamp() else null end
     where meeting_id=p_meeting_id and user_id=v_user returning * into v_person;

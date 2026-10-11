@@ -50,15 +50,20 @@ language plpgsql security definer set search_path = '' as $$
 declare v_photo public.meeting_photos; v_status text;
 begin
   if auth.uid() is null then return false; end if;
-  -- Same meeting-then-photo order as quota reclamation and finish_photo. This
-  -- prevents an expired reservation from disappearing during Storage INSERT.
+  -- Same meeting-then-photo order as quota reclamation and finish_photo for the
+  -- permission transaction. Storage v1.35.3 performs this probe before upload
+  -- with NULL metadata; newer versions provide MIME/declared contentLength.
   select m.status into v_status from public.meetings m join public.meeting_photos p on p.meeting_id=m.id
     where p.path=p_path for update of m;
   if v_status is null or v_status='cancelled' then return false; end if;
   select * into v_photo from public.meeting_photos where path=p_path for key share;
   return found and v_photo.author_id=auth.uid() and not v_photo.ready
-    and private.has_meeting_access(v_photo.meeting_id) and p_metadata->>'size'=v_photo.size_bytes::text
-    and p_metadata->>'mimetype'=v_photo.mime_type;
+    and private.has_meeting_access(v_photo.meeting_id)
+    and (p_metadata is null or (
+      p_metadata->>'mimetype'=v_photo.mime_type
+      and (p_metadata->>'size' is null or p_metadata->>'size'=v_photo.size_bytes::text)
+      and (p_metadata->>'contentLength' is null or p_metadata->>'contentLength'=v_photo.size_bytes::text)
+    ));
 end
 $$;
 create function private.can_delete_photo_object(p_path text) returns boolean
@@ -72,6 +77,47 @@ language sql stable security definer set search_path = '' as $$
     where p.id=p_photo_id and p.author_id=auth.uid() and private.has_meeting_access(p.meeting_id)
     and not exists(select 1 from storage.objects o where o.bucket_id='meeting-photos' and o.name=p.path))
 $$;
+
+-- Storage v1.35.3 rolls its caller permission probe back, then writes final
+-- object metadata as its internal superuser. RLS alone therefore cannot enforce
+-- the final write or prevent an upload completing after reservation reclamation.
+-- This trigger also runs for that final internal write and administrative restore.
+create function private.enforce_photo_object() returns trigger
+language plpgsql security definer set search_path = '' as $$
+declare v_photo public.meeting_photos; v_status text;
+begin
+  if tg_op='UPDATE' and (old.bucket_id='meeting-photos' or new.bucket_id='meeting-photos')
+    and (old.bucket_id is distinct from new.bucket_id or old.name is distinct from new.name) then
+    raise exception 'Перемещать фото между объектами нельзя.' using errcode='42501';
+  end if;
+  if new.bucket_id<>'meeting-photos' then return new; end if;
+  select m.status into v_status from public.meetings m join public.meeting_photos p on p.meeting_id=m.id
+    where p.path=new.name for update of m;
+  select * into v_photo from public.meeting_photos where path=new.name for key share;
+  if not found then raise exception 'Для объекта требуется действующая запись фотографии.' using errcode='42501'; end if;
+  if v_status='cancelled' and not v_photo.ready then
+    raise exception 'Загрузка отменённой встречи прекращена.' using errcode='42501';
+  end if;
+  if new.metadata is null then
+    if v_photo.ready then raise exception 'Метаданные опубликованного фото обязательны.' using errcode='42501'; end if;
+    return new; -- v1.35.3 caller permission probe; it is rolled back by Storage.
+  end if;
+  if jsonb_typeof(new.metadata) is distinct from 'object'
+    or new.metadata->>'mimetype' is distinct from v_photo.mime_type
+    or (new.metadata->>'size' is not null and new.metadata->>'size'<>v_photo.size_bytes::text)
+    or (new.metadata->>'contentLength' is not null and new.metadata->>'contentLength'<>v_photo.size_bytes::text)
+    or (v_photo.ready and new.metadata->>'size' is null) then
+    raise exception 'Тип и размер объекта должны совпадать с фотографией.' using errcode='42501';
+  end if;
+  -- A newer preflight can have MIME/contentLength but no final size. Such a row
+  -- cannot be published: finish_photo requires the final backend metadata.size.
+  -- Existing ready rows allow an admin to restore identical size/MIME metadata,
+  -- including uploaded=true, without a service-role exemption from these checks.
+  return new;
+end $$;
+create trigger meeting_photo_object_integrity before insert or update on storage.objects
+  for each row execute function private.enforce_photo_object();
+revoke all on function private.enforce_photo_object() from public,anon,authenticated;
 
 insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types)
   values('meeting-photos','meeting-photos',false,2097152,array['image/jpeg','image/png','image/webp'])
