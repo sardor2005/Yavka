@@ -1,29 +1,58 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowLeft, ArrowRight, CalendarDays, MapPin, Plus, Trash2, Users } from 'lucide-react';
-import { createMeeting } from '../services/storage.js';
+import { ArrowLeft, ArrowRight, CalendarDays, MapPin, Users } from 'lucide-react';
+import { createMeeting } from '../services/api.js';
 import { useApp } from '../context/AppContext.jsx';
+import { useAuth } from '../context/AuthContext.jsx';
 import { localDate } from '../utils/format.js';
+import { zonedDateTime } from '../utils/time.js';
+import '../meeting.css';
 
-const newTime = () => ({ id: crypto.randomUUID(), date: localDate(1), time: '18:30' });
-const newPlace = () => ({ id: crypto.randomUUID(), name: '', address: '' });
+export const browserTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Tashkent';
+const timeZones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : ['Asia/Tashkent', 'Europe/Moscow', 'Europe/London', 'UTC'];
+
+export function MeetingFields({ value, onChange, disabled = false }) {
+  const update = (key) => (event) => onChange({ ...value, [key]: event.target.value });
+  return <>
+    <label className="field">Название встречи <span className="required">*</span><input value={value.title} onChange={update('title')} placeholder="Например, кофе после пар" required minLength={2} maxLength={100} autoComplete="off" disabled={disabled} /></label>
+    <label className="field">Описание <span className="optional">необязательно</span><textarea value={value.description} onChange={update('description')} placeholder="За чашкой кофе обсудим всё, что накопилось ☕" maxLength={1000} rows={3} disabled={disabled} /></label>
+    <div className="mp-form-grid">
+      <label className="field">Дата <span className="required">*</span><input type="date" required value={value.date} onChange={update('date')} disabled={disabled} /></label>
+      <label className="field">Время <span className="required">*</span><input type="time" required value={value.time} onChange={update('time')} disabled={disabled} /></label>
+      <label className="field mp-span-two">Часовой пояс <span className="required">*</span><input list="meeting-time-zones" required maxLength={100} value={value.timeZone} onChange={update('timeZone')} placeholder="Asia/Tashkent" disabled={disabled} /><datalist id="meeting-time-zones">{timeZones.map((zone) => <option key={zone} value={zone} />)}</datalist></label>
+      <label className="field mp-span-two">Название места <span className="required">*</span><input required maxLength={120} placeholder="Например, любимая кофейня" value={value.placeName} onChange={update('placeName')} disabled={disabled} /></label>
+      <label className="field mp-span-two">Адрес <span className="optional">необязательно</span><input maxLength={250} placeholder="Улица Амира Темура, 12" value={value.placeAddress} onChange={update('placeAddress')} disabled={disabled} /></label>
+    </div>
+  </>;
+}
+
+export function meetingFormInput(form) {
+  return { title: form.title.trim(), description: form.description.trim(), placeName: form.placeName.trim(), placeAddress: form.placeAddress.trim(), startsAt: zonedDateTime(form.date, form.time, form.timeZone.trim()), timeZone: form.timeZone.trim() };
+}
 
 export default function Create() {
-  const [title, setTitle] = useState(''); const [description, setDescription] = useState('');
-  const [organizerName, setOrganizerName] = useState('Сардор');
-  const [timeOptions, setTimes] = useState([newTime()]); const [placeOptions, setPlaces] = useState([newPlace()]);
-  const { mutate } = useApp(); const navigate = useNavigate();
-  const updateTime = (id, patch) => setTimes(items => items.map(item => item.id === id ? { ...item, ...patch } : item));
-  const updatePlace = (id, patch) => setPlaces(items => items.map(item => item.id === id ? { ...item, ...patch } : item));
-  function submit(event) {
+  const [form, setForm] = useState({ title: '', description: '', placeName: '', placeAddress: '', date: localDate(1), time: '18:30', timeZone: browserTimeZone() });
+  const [saving, setSaving] = useState(false);
+  const { mutate } = useApp();
+  const { profile } = useAuth();
+  const navigate = useNavigate();
+
+  async function submit(event) {
     event.preventDefault();
-    const meeting = mutate(() => createMeeting({ title, description, organizerName, timeOptions, placeOptions }), 'Встреча создана. Теперь позовите друзей!');
-    if (meeting) navigate(`/meetings/${meeting.id}`);
+    if (saving) return;
+    setSaving(true);
+    try {
+      const meeting = await mutate(() => createMeeting(meetingFormInput(form)), 'Встреча создана. Теперь позовите друзей!');
+      if (meeting?.id) navigate(`/meetings/${meeting.id}`);
+    } finally { setSaving(false); }
   }
-  return <><Link to="/" className="back-link"><ArrowLeft size={17} />Мои встречи</Link><div className="page-header"><div><span className="eyebrow">НАЧНИТЕ С ИДЕИ</span><h1>Создадим встречу</h1><p className="muted">Предложите варианты. Друзья выберут то, что им подходит.</p></div><span className="badge blue">Без регистрации</span></div><div className="create-layout"><form className="create-form" onSubmit={submit}>
-    <section className="card form-section"><div className="form-section-heading"><span className="section-number">01</span><h2>Что планируем?</h2></div><label className="field">Название встречи <span className="required">*</span><input value={title} onChange={e => setTitle(e.target.value)} placeholder="Например, кофе после пар" required maxLength={100} autoComplete="off" /></label><label className="field">Описание <span className="optional">необязательно</span><textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="За чашкой кофе обсудим всё, что накопилось ☕" maxLength={1000} rows={3} /></label><label className="field">Ваше имя<input value={organizerName} onChange={e => setOrganizerName(e.target.value)} required maxLength={40} autoComplete="given-name" /></label></section>
-    <section className="card form-section"><div className="form-section-heading"><span className="section-number">02</span><h2><CalendarDays size={20} />Когда удобно?</h2></div><p className="muted form-hint">Добавьте один или несколько вариантов даты и времени.</p><div className="option-fields">{timeOptions.map((option, i) => <div className="time-fields" key={option.id}><span className="option-index">{i + 1}</span><label className="field">Дата<input type="date" aria-label={`Дата ${i + 1}`} required value={option.date} onChange={e => updateTime(option.id, { date: e.target.value })} /></label><label className="field">Время<input type="time" aria-label={`Время ${i + 1}`} required value={option.time} onChange={e => updateTime(option.id, { time: e.target.value })} /></label>{timeOptions.length > 1 && <button type="button" className="icon-button remove-option" aria-label={`Удалить время ${i + 1}`} onClick={() => setTimes(items => items.filter(item => item.id !== option.id))}><Trash2 size={18} /></button>}</div>)}</div>{timeOptions.length < 8 && <button type="button" className="button ghost add-option" onClick={() => setTimes(items => [...items, newTime()])}><Plus size={17} />Добавить время</button>}</section>
-    <section className="card form-section"><div className="form-section-heading"><span className="section-number">03</span><h2><MapPin size={20} />Где встречаемся?</h2></div><p className="muted form-hint">Любимая кофейня, парк или просто знакомый адрес.</p><div className="option-fields">{placeOptions.map((option, i) => <div className="place-fields" key={option.id}><span className="option-index">{i + 1}</span><div className="place-inputs"><label className="field">Название места<input required maxLength={100} placeholder="Например, Surf Coffee" value={option.name} onChange={e => updatePlace(option.id, { name: e.target.value })} /></label><label className="field">Адрес <span className="optional">необязательно</span><input maxLength={180} placeholder="Чтобы никто не потерялся" value={option.address} onChange={e => updatePlace(option.id, { address: e.target.value })} /></label></div>{placeOptions.length > 1 && <button type="button" className="icon-button remove-option" aria-label={`Удалить место ${i + 1}`} onClick={() => setPlaces(items => items.filter(item => item.id !== option.id))}><Trash2 size={18} /></button>}</div>)}</div>{placeOptions.length < 8 && <button type="button" className="button ghost add-option" onClick={() => setPlaces(items => [...items, newPlace()])}><Plus size={17} />Добавить место</button>}</section>
-    <div className="create-submit"><span className="muted">После создания появится ссылка для друзей.</span><button className="button primary" type="submit">Создать встречу<ArrowRight size={18} /></button></div>
-    </form><aside className="create-aside"><div className="guide-card"><div className="guide-icon"><Users size={24} /></div><h3>Вы — организатор</h3><p className="muted">Друзья смогут проголосовать за варианты, а итоговый план выберете вы.</p><div className="create-tip"><strong>Планы поменялись?</strong><p>После переноса каждый подтвердит участие заново. Так никто не пропустит изменения.</p></div><span className="badge blue">Один план для всей компании</span></div></aside></div></>;
+
+  return <>
+    <Link to="/" className="back-link"><ArrowLeft size={17} />Мои встречи</Link>
+    <div className="page-header"><div><span className="eyebrow">НАЧНИТЕ С ИДЕИ</span><h1>Создадим встречу</h1><p className="muted">Назначьте время и место. Друзьям останется подтвердить участие.</p></div><span className="badge blue">Общий план для друзей</span></div>
+    <div className="create-layout"><form className="create-form" onSubmit={submit}>
+      <section className="card form-section"><div className="form-section-heading"><span className="section-number">01</span><h2><CalendarDays size={20} />Что планируем?</h2></div><MeetingFields value={form} onChange={setForm} disabled={saving} /><p className="muted form-hint"><MapPin size={14} /> Время указано в выбранном часовом поясе.</p></section>
+      <div className="create-submit"><span className="muted">После создания можно пригласить друзей или отправить ссылку.</span><button className="button primary" type="submit" disabled={saving}>{saving ? 'Создаём встречу…' : 'Создать встречу'}<ArrowRight size={18} /></button></div>
+    </form><aside className="create-aside"><div className="guide-card"><div className="guide-icon"><Users size={24} /></div><h3>Вы — организатор{profile?.name ? `, ${profile.name}` : ''}</h3><p className="muted">Участники увидят единый план, смогут сообщить, что готовы, уже в пути или пришли.</p><div className="create-tip"><strong>Планы поменялись?</strong><p>Отредактируйте встречу. Новый план появится у всей компании.</p></div><span className="badge blue">Меньше переписки. Больше встреч.</span></div></aside></div>
+  </>;
 }
