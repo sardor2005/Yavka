@@ -20,18 +20,19 @@ function foldLine(value) {
   return lines.join('\r\n');
 }
 export function createCalendarEvent(meeting) {
-  if (!meeting?.confirmedTime || !meeting?.confirmedPlace || !['confirmed', 'completed'].includes(meeting.status)) throw new Error('Сначала подтвердите время и место встречи.');
-  const { date, time } = meeting.confirmedTime;
-  const start = new Date(`${date}T${time}:00`);
+  const cloud = !!meeting?.startsAt;
+  if (!cloud && (!meeting?.confirmedTime || !meeting?.confirmedPlace || !['confirmed', 'completed'].includes(meeting.status))) throw new Error('Сначала подтвердите время и место встречи.');
+  const start = cloud ? new Date(meeting.startsAt) : new Date(`${meeting.confirmedTime.date}T${meeting.confirmedTime.time}:00`);
   if (!Number.isFinite(start.getTime())) throw new Error('Не удалось определить время встречи.');
   const end = new Date(start.getTime() + 90 * 60 * 1000);
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
-  const location = [meeting.confirmedPlace.name, meeting.confirmedPlace.address].filter(Boolean).join(', ');
+  const location = cloud ? [meeting.placeName, meeting.placeAddress].filter(Boolean).join(', ') : [meeting.confirmedPlace.name, meeting.confirmedPlace.address].filter(Boolean).join(', ');
+  const eventTime = date => cloud ? date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z') : wallClock(date);
   const lines = [
     'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Yavka//Meetings//RU', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'BEGIN:VEVENT',
-    `UID:${escapeText(meeting.id)}@yavka.local`, `DTSTAMP:${stamp}`, `DTSTART:${wallClock(start)}`, `DTEND:${wallClock(end)}`,
+    `UID:${escapeText(meeting.id)}@yavka.local`, `DTSTAMP:${stamp}`, `DTSTART:${eventTime(start)}`, `DTEND:${eventTime(end)}`,
     `SUMMARY:${escapeText(meeting.title)}`, `DESCRIPTION:${escapeText(meeting.description)}`, `LOCATION:${escapeText(location)}`,
-    `SEQUENCE:${Number.isInteger(meeting.planVersion) ? meeting.planVersion : 0}`, 'STATUS:CONFIRMED', 'END:VEVENT', 'END:VCALENDAR',
+    `SEQUENCE:${Number.isInteger(meeting.planVersion) ? meeting.planVersion : 0}`, `STATUS:${meeting.status === 'cancelled' ? 'CANCELLED' : 'CONFIRMED'}`, 'END:VEVENT', 'END:VCALENDAR',
   ];
   return `${lines.map(foldLine).join('\r\n')}\r\n`;
 }
